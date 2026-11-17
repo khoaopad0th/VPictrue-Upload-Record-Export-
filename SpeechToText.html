@@ -165,22 +165,40 @@ function applyStyle(){
   $('lang').value = S.lang;
 }
 
-/* ---------- ข้อความ ---------- */
-let finalText = '', interim = '', listening = false, errMsg = '', rec = null;
+/* ---------- ข้อความ ----------
+   committed = ข้อความที่สรุปแล้วจากรอบการฟังก่อนหน้า
+   sFinal / sInterim = ข้อความของรอบการฟังปัจจุบัน (ยืนยันแล้ว / ยังไม่ยืนยัน) */
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+let committed = '', sFinal = '', sInterim = '';
+let listening = false, errMsg = '', hint = '', rec = null, timer = 0;
+let quick = 0, silent = 0;
+
+const join = (a, b) => (a && b) ? a + ' ' + b : (a || b);
+const fullText = () => join(join(committed, sFinal), sInterim);
+function commit(){ committed = fullText().trim(); sFinal = ''; sInterim = ''; }
+
+const ERR = {
+  'not-allowed': 'ไม่ได้รับอนุญาตให้ใช้ไมโครโฟน กรุณาอนุญาตในเบราว์เซอร์แล้วลองใหม่',
+  'service-not-allowed': 'ไม่ได้รับอนุญาตให้ใช้ไมโครโฟน กรุณาอนุญาตในเบราว์เซอร์แล้วลองใหม่',
+  'language-not-supported': 'เครื่องนี้ยังไม่รองรับภาษานี้ ให้เปิดแอป Google > ตั้งค่า > เสียง > ภาษา แล้วเพิ่มภาษาที่ต้องการ',
+  'network': 'เชื่อมต่ออินเทอร์เน็ตไม่ได้ การรู้จำเสียงต้องใช้อินเทอร์เน็ต',
+  'audio-capture': 'ไม่พบไมโครโฟน หรือมีแอปอื่นใช้ไมค์อยู่'
+};
 
 function render(){
   out.textContent = '';
-  if (!finalText && !interim){
+  const base = join(committed, sFinal);
+  if (!base && !sInterim){
     out.classList.add('empty');
     out.textContent = 'กดปุ่มไมค์แล้วเริ่มพูด ข้อความจะแสดงตรงนี้';
     return;
   }
   out.classList.remove('empty');
-  out.append(document.createTextNode(finalText));
-  if (interim){
+  out.append(document.createTextNode(base));
+  if (sInterim){
     const s = document.createElement('span');
     s.className = 'interim';
-    s.textContent = (finalText ? ' ' : '') + interim;
+    s.textContent = (base ? ' ' : '') + sInterim;
     out.append(s);
   }
 }
@@ -192,7 +210,7 @@ function ui(){
   $('lang').disabled = listening;
   const st = $('status');
   st.className = errMsg ? 'err' : '';
-  st.textContent = errMsg || (listening ? 'กำลังฟัง… พูดได้เลย' : 'พร้อมใช้งาน');
+  st.textContent = errMsg || hint || (listening ? 'กำลังฟัง (' + S.lang + ') พูดได้เลย' : 'พร้อมใช้งาน');
 }
 
 /* ---------- รู้จำเสียง ---------- */
@@ -202,53 +220,73 @@ if (!SR){
   errMsg = 'เบราว์เซอร์นี้ไม่รองรับการรู้จำเสียง ลองใช้ Chrome หรือ Safari';
 }
 
-function start(){
-  errMsg = '';
+function begin(){
+  clearTimeout(timer);
   if (rec){ rec.onresult = rec.onerror = rec.onend = null; try { rec.abort(); } catch (e) {} }
-  rec = new SR();
-  rec.lang = S.lang;
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.onresult = e => {
-    interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++){
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) finalText += (finalText ? ' ' : '') + t.trim();
-      else interim += t;
+  const r = new SR();
+  rec = r;
+  const t0 = Date.now();
+  let got = false;
+  r.lang = S.lang;
+  /* Android ทำงานไม่เสถียรในโหมดต่อเนื่อง จึงฟังทีละประโยคแล้วเริ่มรอบใหม่เอง */
+  r.continuous = !IS_ANDROID;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+
+  r.onresult = e => {
+    got = true; silent = 0; quick = 0; hint = '';
+    sFinal = ''; sInterim = '';
+    for (let i = 0; i < e.results.length; i++){
+      const t = e.results[i][0].transcript.trim();
+      if (!t) continue;
+      if (e.results[i].isFinal) sFinal = join(sFinal, t); else sInterim = join(sInterim, t);
     }
-    render();
+    render(); ui();
   };
-  rec.onerror = e => {
-    if (e.error === 'no-speech' || e.error === 'aborted') return;
+
+  r.onerror = e => {
+    if (e.error === 'aborted' || e.error === 'no-speech') return;
     listening = false;
-    errMsg = (e.error === 'not-allowed' || e.error === 'service-not-allowed')
-      ? 'ไม่ได้รับอนุญาตให้ใช้ไมโครโฟน กรุณาอนุญาตในเบราว์เซอร์แล้วลองใหม่'
-      : 'เกิดข้อผิดพลาด: ' + e.error;
+    errMsg = ERR[e.error] || 'เกิดข้อผิดพลาด: ' + e.error;
     ui();
   };
-  rec.onend = () => {
-    if (listening){
-      try { rec.start(); return; } catch (e) { listening = false; }
+
+  r.onend = () => {
+    r.ended = true;
+    commit(); render();            /* เก็บข้อความที่ค้างไว้ ไม่ให้หายตอนเริ่มรอบใหม่ */
+    if (!listening){ ui(); return; }
+    if (!got){
+      silent++;
+      if (Date.now() - t0 < 800) quick++;
+      if (quick >= 4){
+        listening = false;
+        errMsg = 'ระบบรู้จำเสียงหยุดทำงานซ้ำๆ ตรวจสอบสิทธิ์ไมค์ อินเทอร์เน็ต และภาษาในแอป Google';
+        ui(); return;
+      }
+      if (silent >= 3) hint = 'ยังไม่ได้ยินเสียง ลองพูดใกล้ไมค์ขึ้น หรือตรวจสอบว่าเปิดภาษานี้ในแอป Google แล้ว';
     }
-    rec.ended = true;
-    finish();
+    ui();
+    timer = setTimeout(() => { if (listening) begin(); }, IS_ANDROID ? 300 : 100);
   };
-  try { rec.start(); listening = true; }
-  catch (e) { listening = false; errMsg = 'เริ่มฟังไม่ได้ ลองกดอีกครั้ง'; }
-  ui();
+
+  try { r.start(); }
+  catch (e) { listening = false; errMsg = 'เริ่มฟังไม่ได้ ลองกดอีกครั้ง'; ui(); }
 }
 
-function finish(){
-  listening = false;
-  if (interim){ finalText += (finalText ? ' ' : '') + interim.trim(); interim = ''; }
-  render(); ui();
+function start(){
+  errMsg = ''; hint = ''; quick = 0; silent = 0;
+  commit();
+  listening = true;
+  ui();
+  begin();
 }
 
 function stop(){
-  listening = false;
+  listening = false; hint = '';
+  clearTimeout(timer);
   ui();
   const cur = rec;
-  if (!cur) return finish();
+  if (!cur){ commit(); render(); return; }
   try { cur.stop(); } catch (e) {}
   /* ถ้าเบราว์เซอร์ไม่ตอบสนองต่อ stop ให้บังคับหยุด */
   setTimeout(() => {
@@ -256,16 +294,20 @@ function stop(){
     cur.onresult = cur.onerror = cur.onend = null;
     try { cur.abort(); } catch (e) {}
     cur.ended = true;
-    finish();
+    commit(); render(); ui();
   }, 700);
 }
 
 $('mic').onclick = () => listening ? stop() : start();
 $('lang').onchange = e => { S.lang = e.target.value; save(); };
 
-$('clear').onclick = () => { finalText = ''; interim = ''; render(); };
+$('clear').onclick = () => {
+  committed = ''; sFinal = ''; sInterim = '';
+  render();
+  if (listening) begin();          /* เริ่มรอบใหม่ เพื่อไม่ให้ข้อความเก่ากลับมา */
+};
 $('copy').onclick = async () => {
-  const t = (finalText + (interim ? ' ' + interim : '')).trim();
+  const t = fullText().trim();
   if (!t) return;
   try { await navigator.clipboard.writeText(t); }
   catch (e) {
@@ -292,5 +334,4 @@ $('reset').onclick = () => {
 applyStyle(); render(); ui();
 </script>
 </body>
-        </html>
-        
+</html>
